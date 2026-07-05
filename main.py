@@ -1,58 +1,69 @@
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
+import time
+import uuid
+from collections import deque
+
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse, JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
 
 app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ============================================================
 # EDIT THIS ONE LINE: put your logged-in email here
 # ============================================================
 YOUR_EMAIL = "22f1000951@ds.study.iitm.ac.in"
 
-API_KEY = "ak_kahe05fn30iv65kf24ga6d17"
+START_TIME = time.time()
+
+REQUEST_COUNTER = Counter("http_requests_total", "Total HTTP requests received")
+
+# In-memory ring buffer of the last 1000 structured log entries.
+LOG_BUFFER = deque(maxlen=1000)
 
 
-class Event(BaseModel):
-    user: str
-    amount: float
-    ts: Optional[int] = None
+class ObservabilityMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        REQUEST_COUNTER.inc()
+        request_id = str(uuid.uuid4())
+
+        response = await call_next(request)
+
+        LOG_BUFFER.append({
+            "level": "info",
+            "ts": time.time(),
+            "path": request.url.path,
+            "request_id": request_id,
+            "method": request.method,
+            "status_code": response.status_code,
+        })
+
+        response.headers["X-Request-ID"] = request_id
+        return response
 
 
-class AnalyticsRequest(BaseModel):
-    events: List[Event]
+app.add_middleware(ObservabilityMiddleware)
 
 
-@app.post("/analytics")
-def analytics(payload: AnalyticsRequest, x_api_key: Optional[str] = Header(None)):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Missing or invalid API key")
+@app.get("/work")
+def work(n: int = 0):
+    total = 0
+    for i in range(n):
+        total += i
+    return {"email": YOUR_EMAIL, "done": n}
 
-    events = payload.events
 
-    total_events = len(events)
-    unique_users = len({e.user for e in events})
+@app.get("/metrics")
+def metrics():
+    return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-    positive_events = [e for e in events if e.amount > 0]
-    revenue = sum(e.amount for e in positive_events)
 
-    totals_by_user = {}
-    for e in positive_events:
-        totals_by_user[e.user] = totals_by_user.get(e.user, 0) + e.amount
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok", "uptime_s": time.time() - START_TIME}
 
-    top_user = max(totals_by_user, key=totals_by_user.get) if totals_by_user else None
 
-    return {
-        "email": YOUR_EMAIL,
-        "total_events": total_events,
-        "unique_users": unique_users,
-        "revenue": revenue,
-        "top_user": top_user,
-    }
+@app.get("/logs/tail")
+def logs_tail(limit: int = 10):
+    entries = list(LOG_BUFFER)[-limit:] if limit > 0 else []
+    return JSONResponse(content=entries)
